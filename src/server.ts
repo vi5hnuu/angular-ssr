@@ -5,6 +5,27 @@ import express from 'express';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import NodeCache from 'node-cache';
+import MarkdownIt from 'markdown-it';
+import hljs from 'highlight.js'
+import fs from 'fs'
+import path from 'path'
+const md = new MarkdownIt({
+  html:true,
+  typographer: true,
+  breaks: true,
+  linkify: true,
+  langPrefix: 'language-',
+  highlight: function (str:any, lang:any) {
+    console.log('highlight :: ',str,lang)
+    if (lang && hljs.getLanguage(lang)) {
+      try {
+        return `<div class="hljs-lang">${hljs.highlight(str, { language: lang }).value}</div>`;
+      } catch (__) {}
+    }
+
+    return ''; // use external default escaping
+  }
+});
 
 const serverDistFolder = dirname(fileURLToPath(import.meta.url));
 const browserDistFolder = resolve(serverDistFolder, '../browser');
@@ -84,6 +105,48 @@ app.use(
   })
 );
 
+app.get('/api/test', async (req, res, next) => {
+  const cacheKey = `page:${req.originalUrl}`;
+  const cached = renderCache.get(cacheKey);
+
+  if (cached) {
+    cacheStats.hits++;
+    log('DEBUG', `Local cache HIT: ${req.originalUrl||req.url}`);
+
+    // Set CloudFront cache headers
+    setCacheHeaders(res, 300, 3600); // 5min browser, 1hr CloudFront
+
+    return res.send(cached);
+  }
+
+  // Cache miss - perform SSR
+  cacheStats.misses++;
+  log('DEBUG', `Local cache MISS test: ${req.originalUrl}`);
+
+  try {
+    cacheStats.renders++;
+    const mdPath = path.resolve(serverDistFolder, '../browser/assets/dummy.md');
+    if (!fs.existsSync(mdPath)) {
+      log('ERROR', 'dummy.md not found in bundle', { mdPath });
+      return res.status(404).send('dummy.md not found');
+    }
+
+    const content = fs.readFileSync(mdPath, 'utf-8');
+    const html = md.render(content);
+    renderCache.set(cacheKey, html);
+
+    // Set appropriate cache headers based on content type
+    const cacheStrategy = getCacheStrategy(req.originalUrl || req.url);
+    console.log('cacheStrategy',cacheStrategy,req.url)
+    setCacheHeaders(res, cacheStrategy.browser, cacheStrategy.cdn);
+
+    return res.status(200).json({html});
+  } catch (error: any) {
+    log('ERROR', `SSR error: ${req.url}`, { error: error.message });
+    return next(error);
+  }
+});
+
 // SSR with multi-tier caching
 app.use('/**', async (req, res, next) => {
   // Skip caching for certain routes
@@ -110,10 +173,9 @@ app.use('/**', async (req, res, next) => {
 
   // Cache miss - perform SSR
   cacheStats.misses++;
-  log('DEBUG', `Local cache MISS: ${req.url}`);
+  log('DEBUG', `Local cache MISS: ${req.originalUrl}`);
 
   try {
-    if(req.originalUrl==='/test') return res.send(`<h1>🚀 Angular SSR Engine Live — Rendering the Future, One Request at a Time.</h1>`)
     const response = await angularApp.handle(req);
 
     if (response) {
@@ -170,7 +232,7 @@ function getCacheStrategy(url: string) {
   }
 
   // Blog posts - moderate caching
-  if (url.match(/^\/test\//)) {
+  if (url.match(/^\/api\/test\//)) {
     return { browser: 600, cdn: 7200 }; // 10min / 2hr
   }
 
